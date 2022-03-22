@@ -4,9 +4,9 @@ static const Block blocks[] = {
 	// {" ", "free -h | awk '/^Mem/ { print $3\"/\"$2 }' | sed s/i//g",	30,		0},
 	{"", "cat /tmp/recordingicon 2>/dev/null",	0,	9},
 	{"", "checkupdates | wc -l | awk '{$1 > 0 ? res = \" \" $1 : res = \"\"; print res}'", 30, 1},
-	{"", "curl -s https://wttr.in/Berlin?format=%t | awk '{ print \" \" $1 }'", 30, 6},
+	{" ", "curl -s https://wttr.in/Berlin?format=%t", 3600, 6},
 	{" ", "cpu_usage", 30, 2},
-	{" ", "free | grep Mem | awk '{ printf(\"%.2f%\", $3/$2 * 100.0) }'", 30, 3},
+	{" ", "free | grep Mem | awk '{ printf(\"%.2f%\", $3/$2 * 100.0) }'", 3600, 3},
 	{"", "battery", 30, 4},
 	{"", "date '+%a %d %b %I:%M %P'",					5,		5},
 };
