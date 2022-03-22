@@ -8,9 +8,9 @@ static const Block blocks[] = {
 	{" ", "cpu_usage", 30, 2},
 	{" ", "free | grep Mem | awk '{ printf(\"%.2f%\", $3/$2 * 100.0) }'", 3600, 3},
 	{"", "battery", 30, 4},
-	{"", "date '+%a %d %b %I:%M %P'",					5,		5},
+	{"", "date '+%a %d %b %I:%M %P' ",					5,		5},
 };
 
 //sets delimeter between status commands. NULL character ('\0') means no delimeter.
-static char delim[] = "  ";
-static unsigned int delimLen = 5;
+static char delim[] = " ";
+static unsigned int delimLen = 2;
