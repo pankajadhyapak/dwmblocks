@@ -39,14 +39,17 @@ static Display* dpy;
 static int screen;
 static Window root;
 static unsigned short statusContinue = 1;
-static char outputs[LEN(blocks)][CMDLENGTH + 1 + CLICKABLE_BLOCKS];
-static char statusBar[2][LEN(blocks) * (LEN(outputs[0]) - 1) + (LEN(blocks) - 1 + LEADING_DELIMITER) * (LEN(DELIMITER) - 1) + 1];
-static struct epoll_event event, events[LEN(blocks) + 2];
+static struct epoll_event event;
 static int pipes[LEN(blocks)][2];
-static int timerPipe[2];
+static int timer = 0, timerTick = 0, maxInterval = 1;
 static int signalFD;
 static int epollFD;
 static int execLock = 0;
+
+// Longest UTF-8 character is 4 bytes long
+static char outputs[LEN(blocks)][CMDLENGTH * 4 + 1 + CLICKABLE_BLOCKS];
+static char statusBar[2][LEN(blocks) * (LEN(outputs[0]) - 1) + (LEN(blocks) - 1 + LEADING_DELIMITER) * (LEN(DELIMITER) - 1) + 1];
+
 void (*writeStatus)();
 
 int gcd(int a, int b) {
@@ -79,7 +82,7 @@ void execBlock(int i, const char* button) {
 		if (button)
 			setenv("BLOCK_BUTTON", button, 1);
 		execl("/bin/sh", "sh", "-c", blocks[i].command, (char*)NULL);
-		_exit(1);
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -110,19 +113,27 @@ void updateBlock(int i) {
 	char buffer[LEN(outputs[0]) - CLICKABLE_BLOCKS];
 	int bytesRead = read(pipes[i][0], buffer, LEN(buffer));
 
-	// Trim UTF-8 characters properly
-	int j = bytesRead - 1;
-	while ((buffer[j] & 0b11000000) == 0x80)
-		j--;
+	// Trim UTF-8 string to desired length
+	int count = 0, j = 0;
+	while (buffer[j] != '\n' && count < CMDLENGTH) {
+		count++;
+
+		// Skip continuation bytes, if any
+		char ch = buffer[j];
+		int skip = 1;
+		while ((ch & 0xc0) > 0x80)
+			ch <<= 1, skip++;
+		j += skip;
+	}
 
 	// Cache last character and replace it with a trailing space
 	char ch = buffer[j];
 	buffer[j] = ' ';
 
 	// Trim trailing spaces
-	while (buffer[j] == ' ')
+	while (j >= 0 && buffer[j] == ' ')
 		j--;
-	buffer[j + 1] = '\0';
+	buffer[j + 1] = 0;
 
 	// Clear the pipe
 	if (bytesRead == LEN(buffer)) {
@@ -152,18 +163,23 @@ void debug() {
 	write(STDOUT_FILENO, "\n", 1);
 }
 
+int setupX() {
+	dpy = XOpenDisplay(NULL);
+	if (!dpy)
+		return 1;
+
+	screen = DefaultScreen(dpy);
+	root = RootWindow(dpy, screen);
+	return 0;
+}
+
 void setRoot() {
 	// Only set root if text has changed
 	if (!getStatus(statusBar[0], statusBar[1]))
 		return;
 
-	Display* d = XOpenDisplay(NULL);
-	if (d)
-		dpy = d;
-	screen = DefaultScreen(dpy);
-	root = RootWindow(dpy, screen);
 	XStoreName(dpy, root, statusBar[0]);
-	XCloseDisplay(dpy);
+	XFlush(dpy);
 }
 
 void signalHandler() {
@@ -171,8 +187,17 @@ void signalHandler() {
 	read(signalFD, &info, sizeof(info));
 	unsigned int signal = info.ssi_signo;
 
-	// Update all blocks on receiving SIGUSR1
-	if (signal == SIGUSR1) {
+	switch (signal) {
+	case SIGALRM:
+		// Schedule the next timer event and execute blocks
+		alarm(timerTick);
+		execBlocks(timer);
+
+		// Wrap `timer` to the interval [1, `maxInterval`]
+		timer = (timer + timerTick - 1) % maxInterval + 1;
+		return;
+	case SIGUSR1:
+		// Update all blocks on receiving SIGUSR1
 		execBlocks(0);
 		return;
 	}
@@ -191,13 +216,25 @@ void termHandler() {
 }
 
 void setupSignals() {
-	// Ignore SIGUSR1 and all realtime signals
-	sigset_t ignoredSignals;
-	sigemptyset(&ignoredSignals);
-	sigaddset(&ignoredSignals, SIGUSR1);
+	sigset_t handledSignals;
+	sigemptyset(&handledSignals);
+	sigaddset(&handledSignals, SIGUSR1);
+	sigaddset(&handledSignals, SIGALRM);
+
+	// Append all block signals to `handledSignals`
+	for (int i = 0; i < LEN(blocks); i++)
+		if (blocks[i].signal > 0)
+			sigaddset(&handledSignals, SIGRTMIN + blocks[i].signal);
+
+	// Create a signal file descriptor for epoll to watch
+	signalFD = signalfd(-1, &handledSignals, 0);
+	event.data.u32 = LEN(blocks);
+	epoll_ctl(epollFD, EPOLL_CTL_ADD, signalFD, &event);
+
+	// Block all realtime and handled signals
 	for (int i = SIGRTMIN; i <= SIGRTMAX; i++)
-		sigaddset(&ignoredSignals, i);
-	sigprocmask(SIG_BLOCK, &ignoredSignals, NULL);
+		sigaddset(&handledSignals, i);
+	sigprocmask(SIG_BLOCK, &handledSignals, NULL);
 
 	// Handle termination signals
 	signal(SIGINT, termHandler);
@@ -209,107 +246,67 @@ void setupSignals() {
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = SA_NOCLDWAIT;
 	sigaction(SIGCHLD, &sa, 0);
-
-	// Handle block update signals
-	sigset_t handledSignals;
-	sigemptyset(&handledSignals);
-	sigaddset(&handledSignals, SIGUSR1);
-	for (int i = 0; i < LEN(blocks); i++)
-		if (blocks[i].signal > 0)
-			sigaddset(&handledSignals, SIGRTMIN + blocks[i].signal);
-	signalFD = signalfd(-1, &handledSignals, 0);
-	event.data.u32 = LEN(blocks) + 1;
-	epoll_ctl(epollFD, EPOLL_CTL_ADD, signalFD, &event);
 }
 
 void statusLoop() {
+	// Update all blocks initially
+	raise(SIGALRM);
+
+	struct epoll_event events[LEN(blocks) + 1];
 	while (statusContinue) {
 		int eventCount = epoll_wait(epollFD, events, LEN(events), -1);
 		for (int i = 0; i < eventCount; i++) {
 			unsigned short id = events[i].data.u32;
-
-			if (id == LEN(blocks)) {
-				unsigned int j = 0;
-				read(timerPipe[0], &j, sizeof(j));
-				execBlocks(j);
-			} else if (id < LEN(blocks)) {
-				updateBlock(events[i].data.u32);
-			} else {
+			if (id < LEN(blocks))
+				updateBlock(id);
+			else
 				signalHandler();
-			}
 		}
+
 		if (eventCount != -1)
 			writeStatus();
 	}
 }
 
-void timerLoop() {
-	close(timerPipe[0]);
-
-	unsigned int sleepInterval = 0;
-	unsigned int maxInterval = 0;
-	for (int i = 0; i < LEN(blocks); i++)
-		if (blocks[i].interval) {
-			maxInterval = MAX(blocks[i].interval, maxInterval);
-			sleepInterval = gcd(blocks[i].interval, sleepInterval);
-		}
-
-	unsigned int i = 0;
-	struct timespec sleepTime = {sleepInterval, 0};
-	struct timespec toSleep = sleepTime;
-
-	while (statusContinue) {
-		// Notify parent to update blocks
-		write(timerPipe[1], &i, sizeof(i));
-
-		// Wrap `i` to the interval [1, `maxInterval`]
-		i = (i + sleepInterval - 1) % maxInterval + 1;
-
-		// Sleep for `sleepTime` even on being interrupted
-		while (nanosleep(&toSleep, &toSleep) == -1)
-			;
-		toSleep = sleepTime;
-	}
-
-	close(timerPipe[1]);
-	_exit(0);
-}
-
 void init() {
-	epollFD = epoll_create(LEN(blocks) + 1);
+	epollFD = epoll_create(LEN(blocks));
 	event.events = EPOLLIN;
 
 	for (int i = 0; i < LEN(blocks); i++) {
+		// Append each block's pipe to `epollFD`
 		pipe(pipes[i]);
 		event.data.u32 = i;
 		epoll_ctl(epollFD, EPOLL_CTL_ADD, pipes[i][0], &event);
-	}
 
-	pipe(timerPipe);
-	event.data.u32 = LEN(blocks);
-	epoll_ctl(epollFD, EPOLL_CTL_ADD, timerPipe[0], &event);
+		// Calculate the max interval and tick size for the timer
+		if (blocks[i].interval) {
+			maxInterval = MAX(blocks[i].interval, maxInterval);
+			timerTick = gcd(blocks[i].interval, timerTick);
+		}
+	}
 
 	setupSignals();
 }
 
 int main(const int argc, const char* argv[]) {
+	if (setupX()) {
+		fprintf(stderr, "dwmblocks: Failed to open display\n");
+		return 1;
+	}
+
 	writeStatus = setRoot;
 	for (int i = 0; i < argc; i++)
 		if (!strcmp("-d", argv[i]))
 			writeStatus = debug;
 
 	init();
+	statusLoop();
 
-	// Ensure that `timerLoop()` only runs in the fork
-	if (fork() == 0)
-		timerLoop();
-	else
-		statusLoop();
-
+	XCloseDisplay(dpy);
 	close(epollFD);
 	close(signalFD);
-	closePipe(timerPipe);
 	for (int i = 0; i < LEN(pipes); i++)
 		closePipe(pipes[i]);
+
 	return 0;
 }
